@@ -464,9 +464,15 @@ namespace platf {
    * @param i The `INPUT` struct to send.
    */
   void send_input(INPUT &i) {
-  retry:
-    auto send = SendInput(1, &i, sizeof(INPUT));
-    if (send != 1) {
+      retry:
+          UINT send;
+          if (i.type == INPUT_KEYBOARD) {
+            keybd_event(i.ki.wVk, i.ki.wScan, i.ki.dwFlags, i.ki.dwExtraInfo);
+            send = 1;
+          } else {
+        send = SendInput(1, &i, sizeof(INPUT));
+      }
+      if (send != 1) {
       auto hDesk = syncThreadDesktop();
       if (_lastKnownInputDesktop != hDesk) {
         _lastKnownInputDesktop = hDesk;
