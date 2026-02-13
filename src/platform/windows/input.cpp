@@ -15,6 +15,7 @@
 #include <ViGEm/Client.h>
 
 // local includes
+#include "interception_helper.h"
 #include "keylayout.h"
 #include "misc.h"
 #include "src/config.h"
@@ -445,6 +446,8 @@ namespace platf {
     decltype(CreateSyntheticPointerDevice) *fnCreateSyntheticPointerDevice;
     decltype(InjectSyntheticPointerInput) *fnInjectSyntheticPointerInput;
     decltype(DestroySyntheticPointerDevice) *fnDestroySyntheticPointerDevice;
+
+    interception::InterceptionState interception_state;
   };
 
   input_t input() {
@@ -461,6 +464,11 @@ namespace platf {
     raw.fnCreateSyntheticPointerDevice = (decltype(CreateSyntheticPointerDevice) *) GetProcAddress(GetModuleHandleA("user32.dll"), "CreateSyntheticPointerDevice");
     raw.fnInjectSyntheticPointerInput = (decltype(InjectSyntheticPointerInput) *) GetProcAddress(GetModuleHandleA("user32.dll"), "InjectSyntheticPointerInput");
     raw.fnDestroySyntheticPointerDevice = (decltype(DestroySyntheticPointerDevice) *) GetProcAddress(GetModuleHandleA("user32.dll"), "DestroySyntheticPointerDevice");
+
+    // Initialize Interception driver for keyboard input (bypasses LLKHF_INJECTED flag)
+    if (!raw.interception_state.init()) {
+      BOOST_LOG(warning) << "Interception driver not available. Keyboard will use SendInput."sv;
+    }
 
     return result;
   }
@@ -633,30 +641,23 @@ namespace platf {
   }
 
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags) {
-    INPUT i {};
-    i.type = INPUT_KEYBOARD;
-    auto &ki = i.ki;
+    auto &raw = *(input_raw_t *) input.get();
 
-    // If the client did not normalize this VK code to a US English layout, we can't accurately convert it to a scancode.
-    // If we're set to always send scancodes, we will use the current keyboard layout to convert to a scancode. This will
-    // assume the client and host have the same keyboard layout, but it's probably better than always using US English.
+    // Determine scancode
+    unsigned short scancode = 0;
     if (!(flags & SS_KBE_FLAG_NON_NORMALIZED)) {
-      // Mask off the extended key byte
-      ki.wScan = VK_TO_SCANCODE_MAP[modcode & 0xFF];
+      // If the client did not normalize this VK code to a US English layout, we can't accurately convert it to a scancode.
+      scancode = VK_TO_SCANCODE_MAP[modcode & 0xFF];
     } else if (config::input.always_send_scancodes && modcode != VK_LWIN && modcode != VK_RWIN && modcode != VK_PAUSE) {
+      // If we're set to always send scancodes, we will use the current keyboard layout to convert to a scancode. This will
+      // assume the client and host have the same keyboard layout, but it's probably better than always using US English.
       // For some reason, MapVirtualKey(VK_LWIN, MAPVK_VK_TO_VSC) doesn't seem to work :/
-      ki.wScan = MapVirtualKey(modcode, MAPVK_VK_TO_VSC);
+      scancode = MapVirtualKey(modcode, MAPVK_VK_TO_VSC);
     }
 
-    // If we can map this to a scancode, send it as a scancode for maximum game compatibility.
-    if (ki.wScan) {
-      ki.dwFlags = KEYEVENTF_SCANCODE;
-    } else {
-      // If there is no scancode mapping or it's non-normalized, send it as a regular VK event.
-      ki.wVk = modcode;
-    }
-
+    // Determine if this is an extended key (E0 prefix)
     // https://docs.microsoft.com/en-us/windows/win32/inputdev/about-keyboard-input#keystroke-message-flags
+    bool extended = false;
     switch (modcode) {
       case VK_LWIN:
       case VK_RWIN:
@@ -674,10 +675,33 @@ namespace platf {
       case VK_RIGHT:
       case VK_DIVIDE:
       case VK_APPS:
-        ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+        extended = true;
         break;
       default:
         break;
+    }
+
+    // Try Interception first for scancode-based input (bypasses LLKHF_INJECTED flag)
+    if (scancode && raw.interception_state.ic_keyboard_device) {
+      if (raw.interception_state.send_keyboard(scancode, extended, release)) {
+        return;  // Sent via Interception driver — no LLKHF_INJECTED flag
+      }
+    }
+
+    // Fall back to SendInput
+    INPUT i {};
+    i.type = INPUT_KEYBOARD;
+    auto &ki = i.ki;
+
+    if (scancode) {
+      ki.wScan = scancode;
+      ki.dwFlags = KEYEVENTF_SCANCODE;
+    } else {
+      ki.wVk = modcode;
+    }
+
+    if (extended) {
+      ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
     }
 
     if (release) {
