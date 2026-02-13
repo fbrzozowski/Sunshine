@@ -539,6 +539,38 @@ namespace platf {
     send_input(i);
   }
 
+  void move_mouse_batch(input_t &input, const std::vector<std::pair<int, int>> &deltas) {
+    if (deltas.empty()) {
+      return;
+    }
+
+    // Single event can use the simple path
+    if (deltas.size() == 1) {
+      move_mouse(input, deltas[0].first, deltas[0].second);
+      return;
+    }
+
+    std::vector<INPUT> inputs(deltas.size());
+    for (size_t idx = 0; idx < deltas.size(); ++idx) {
+      inputs[idx] = {};
+      inputs[idx].type = INPUT_MOUSE;
+      inputs[idx].mi.dwFlags = MOUSEEVENTF_MOVE;
+      inputs[idx].mi.dx = deltas[idx].first;
+      inputs[idx].mi.dy = deltas[idx].second;
+    }
+
+  retry:
+    auto sent = SendInput((UINT) inputs.size(), inputs.data(), sizeof(INPUT));
+    if (sent != inputs.size()) {
+      auto hDesk = syncThreadDesktop();
+      if (_lastKnownInputDesktop != hDesk) {
+        _lastKnownInputDesktop = hDesk;
+        goto retry;
+      }
+      BOOST_LOG(error) << "Couldn't send batched mouse input"sv;
+    }
+  }
+
   util::point_t get_mouse_loc(input_t &input) {
     throw std::runtime_error("not implemented yet, has to pass tests");
     // TODO: Tests are failing, something wrong here?

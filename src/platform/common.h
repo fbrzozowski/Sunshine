@@ -752,6 +752,7 @@ namespace platf {
    */
   util::point_t get_mouse_loc(input_t &input);
   void move_mouse(input_t &input, int deltaX, int deltaY);
+  void move_mouse_batch(input_t &input, const std::vector<std::pair<int, int>> &deltas);
   void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y);
   void button_mouse(input_t &input, int button, bool release);
   void scroll(input_t &input, int distance);

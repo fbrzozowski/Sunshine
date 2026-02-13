@@ -390,6 +390,12 @@ const KeyCodeMap kKeyCodesMap[] = {
     post_mouse(input, kCGMouseButtonLeft, event_type_mouse(input), location, current, 0);
   }
 
+  void move_mouse_batch(input_t &input, const std::vector<std::pair<int, int>> &deltas) {
+    for (auto &[dx, dy] : deltas) {
+      move_mouse(input, dx, dy);
+    }
+  }
+
   void abs_mouse(
     input_t &input,
     const touch_port_t &touch_port,

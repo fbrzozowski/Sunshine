@@ -39,6 +39,12 @@ namespace platf {
     platf::mouse::move(raw, deltaX, deltaY);
   }
 
+  void move_mouse_batch(input_t &input, const std::vector<std::pair<int, int>> &deltas) {
+    for (auto &[dx, dy] : deltas) {
+      move_mouse(input, dx, dy);
+    }
+  }
+
   void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y) {
     auto raw = (input_raw_t *) input.get();
     platf::mouse::move_abs(raw, touch_port, x, y);

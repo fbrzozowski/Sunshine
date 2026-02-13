@@ -9,6 +9,7 @@ extern "C" {
 }
 
 // standard includes
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cmath>
@@ -193,6 +194,8 @@ namespace input {
 
     int32_t accumulated_vscroll_delta;
     int32_t accumulated_hscroll_delta;
+
+    std::atomic<bool> processing_scheduled {false};
   };
 
   /**
@@ -1170,14 +1173,18 @@ namespace input {
             state.buttonFlags |= platf::HOME;
             platf::gamepad_update(platf_input, gamepad.id, state);
 
-            // Sleep for a short time to allow the input to be detected
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // Schedule delayed release of Home button instead of blocking the thread
+            task_pool.pushDelayed([input, controller]() {
+              auto &gamepad = input->gamepads[controller];
+              auto &state = gamepad.gamepad_state;
 
-            // Release Home button
-            state.buttonFlags &= ~platf::HOME;
-            platf::gamepad_update(platf_input, gamepad.id, state);
+              // Release Home button
+              state.buttonFlags &= ~platf::HOME;
+              platf::gamepad_update(platf_input, gamepad.id, state);
 
-            gamepad.back_timeout_id = nullptr;
+              gamepad.back_timeout_id = nullptr;
+            },
+                                  100ms);
           };
 
           gamepad.back_timeout_id = task_pool.pushDelayed(std::move(f), config::input.back_button_timeout).task_id;
@@ -1209,10 +1216,10 @@ namespace input {
     short deltaX, deltaY;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->deltaX), util::endian::big(src->deltaX), &deltaX)) {
+    if (__builtin_add_overflow(util::endian::big(dest->deltaX), util::endian::big(src->deltaX), &deltaX)) {
       return batch_result_e::terminate_batch;
     }
-    if (!__builtin_add_overflow(util::endian::big(dest->deltaY), util::endian::big(src->deltaY), &deltaY)) {
+    if (__builtin_add_overflow(util::endian::big(dest->deltaY), util::endian::big(src->deltaY), &deltaY)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1249,7 +1256,7 @@ namespace input {
     short scrollAmt;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->scrollAmt1), util::endian::big(src->scrollAmt1), &scrollAmt)) {
+    if (__builtin_add_overflow(util::endian::big(dest->scrollAmt1), util::endian::big(src->scrollAmt1), &scrollAmt)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1269,7 +1276,7 @@ namespace input {
     short scrollAmt;
 
     // Batching is safe as long as the result doesn't overflow a 16-bit integer
-    if (!__builtin_add_overflow(util::endian::big(dest->scrollAmount), util::endian::big(src->scrollAmount), &scrollAmt)) {
+    if (__builtin_add_overflow(util::endian::big(dest->scrollAmount), util::endian::big(src->scrollAmount), &scrollAmt)) {
       return batch_result_e::terminate_batch;
     }
 
@@ -1475,58 +1482,12 @@ namespace input {
   }
 
   /**
-   * @brief Called on a thread pool thread to process an input message.
+   * @brief Dispatch a single non-mouse-move input entry.
    * @param input The input context pointer.
+   * @param payload The input packet header.
    */
-  void passthrough_next_message(std::shared_ptr<input_t> input) {
-    // 'entry' backs the 'payload' pointer, so they must remain in scope together
-    std::vector<uint8_t> entry;
-    PNV_INPUT_HEADER payload;
-
-    // Lock the input queue while batching, but release it before sending
-    // the input to the OS. This avoids potentially lengthy lock contention
-    // in the control stream thread while input is being processed by the OS.
-    {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
-
-      // If all entries have already been processed, nothing to do
-      if (input->input_queue.empty()) {
-        return;
-      }
-
-      // Pop off the first entry, which we will send
-      entry = input->input_queue.front();
-      payload = (PNV_INPUT_HEADER) entry.data();
-      input->input_queue.pop_front();
-
-      // Try to batch with remaining items on the queue
-      auto i = input->input_queue.begin();
-      while (i != input->input_queue.end()) {
-        auto batchable_entry = *i;
-        auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
-
-        auto batch_result = batch(payload, batchable_payload);
-        if (batch_result == batch_result_e::terminate_batch) {
-          // Stop batching
-          break;
-        } else if (batch_result == batch_result_e::batched) {
-          // Erase this entry since it was batched
-          i = input->input_queue.erase(i);
-        } else {
-          // We couldn't batch this entry, but try to batch later entries.
-          i++;
-        }
-      }
-    }
-
-    // Print the final input packet
-    input::print((void *) payload);
-
-    // Send the batched input to the OS
+  void dispatch_single(std::shared_ptr<input_t> &input, PNV_INPUT_HEADER payload) {
     switch (util::endian::little(payload->magic)) {
-      case MOUSE_MOVE_REL_MAGIC_GEN5:
-        passthrough(input, (PNV_REL_MOUSE_MOVE_PACKET) payload);
-        break;
       case MOUSE_MOVE_ABS_MAGIC:
         passthrough(input, (PNV_ABS_MOUSE_MOVE_PACKET) payload);
         break;
@@ -1572,6 +1533,91 @@ namespace input {
   }
 
   /**
+   * @brief Called on a thread pool thread to process all pending input messages.
+   * @param input The input context pointer.
+   */
+  void passthrough_next_message(std::shared_ptr<input_t> input) {
+    while (true) {
+      // 'entry' and 'entries' back the 'payload' pointer(s), so they must remain in scope together
+      std::vector<uint8_t> entry;
+      PNV_INPUT_HEADER payload;
+
+      // For relative mouse batching: collect individual deltas for batched platform dispatch
+      std::vector<std::vector<uint8_t>> rel_mouse_entries;
+      std::vector<std::pair<int, int>> rel_mouse_deltas;
+
+      // Lock the input queue while collecting entries to process
+      {
+        std::lock_guard<std::mutex> lg(input->input_queue_lock);
+
+        if (input->input_queue.empty()) {
+          // Clear the scheduling flag so new arrivals will push a task
+          input->processing_scheduled.store(false);
+
+          // Double-check: items may have arrived between our last pop and clearing the flag
+          if (!input->input_queue.empty()) {
+            if (!input->processing_scheduled.exchange(true)) {
+              task_pool.push(passthrough_next_message, input);
+            }
+          }
+          return;
+        }
+
+        // Peek at the first entry to determine the message type
+        entry = input->input_queue.front();
+        payload = (PNV_INPUT_HEADER) entry.data();
+
+        if (util::endian::little(payload->magic) == MOUSE_MOVE_REL_MAGIC_GEN5) {
+          // Collect all contiguous relative mouse move entries as individual deltas
+          while (!input->input_queue.empty()) {
+            auto &front = input->input_queue.front();
+            auto front_header = (PNV_INPUT_HEADER) front.data();
+
+            if (util::endian::little(front_header->magic) != MOUSE_MOVE_REL_MAGIC_GEN5) {
+              break;
+            }
+
+            auto pkt = (PNV_REL_MOUSE_MOVE_PACKET) front_header;
+            rel_mouse_deltas.emplace_back(util::endian::big(pkt->deltaX), util::endian::big(pkt->deltaY));
+            rel_mouse_entries.push_back(std::move(front));
+            input->input_queue.pop_front();
+          }
+        } else {
+          // For non-mouse-move events, use existing batch logic
+          input->input_queue.pop_front();
+
+          auto i = input->input_queue.begin();
+          while (i != input->input_queue.end()) {
+            auto batchable_entry = *i;
+            auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
+
+            auto batch_result = batch(payload, batchable_payload);
+            if (batch_result == batch_result_e::terminate_batch) {
+              break;
+            } else if (batch_result == batch_result_e::batched) {
+              i = input->input_queue.erase(i);
+            } else {
+              i++;
+            }
+          }
+        }
+      }
+
+      // Dispatch outside the lock
+      if (!rel_mouse_deltas.empty()) {
+        // Apply side effect: disable left button delay when relative mouse is active
+        if (config::input.mouse) {
+          input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
+          platf::move_mouse_batch(platf_input, rel_mouse_deltas);
+        }
+      } else {
+        input::print((void *) payload);
+        dispatch_single(input, payload);
+      }
+    }
+  }
+
+  /**
    * @brief Called on the control stream thread to queue an input message.
    * @param input The input context pointer.
    * @param input_data The input message.
@@ -1581,7 +1627,11 @@ namespace input {
       std::lock_guard<std::mutex> lg(input->input_queue_lock);
       input->input_queue.push_back(std::move(input_data));
     }
-    task_pool.push(passthrough_next_message, input);
+
+    // Only push a processing task if one isn't already scheduled/running
+    if (!input->processing_scheduled.exchange(true)) {
+      task_pool.push(passthrough_next_message, input);
+    }
   }
 
   void reset(std::shared_ptr<input_t> &input) {
